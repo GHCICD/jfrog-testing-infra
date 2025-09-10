@@ -13,5 +13,16 @@ frontend:
     ping:
       retries: 900
 
+router:
+  topology:
+    local:
+      healthCheck:
+        interval: 10s           
+        requestTimeout: 15s    
+        healthyThreshold: 1     
+        unhealthyThreshold: 6 
+  serviceRegistry:
+    requestTimeout: 30s
+
 evidence:
   enabled: false
