@@ -39,6 +39,7 @@ const (
 	githubEnvFileEnv = "GITHUB_ENV"
 	// #nosec G101 -- False positive - no hardcoded credentials
 	jfrogLocalAccessToken = "JFROG_TESTS_LOCAL_ACCESS_TOKEN"
+	jfrogIsOssVariant = "JFROG_TESTS_IS_OSS_VARIANT"
 )
 
 var (
@@ -61,8 +62,10 @@ var (
 		"topology-service.log",
 	}
 
-	//go:embed system.yaml
-	systemYaml string
+	//go:embed pro/system.yaml
+	systemYamlPro string
+	//go:embed oss/system.yaml
+	systemYamlOss string
 	//go:embed access.config.import.yml
 	accessConfig string
 )
@@ -79,6 +82,8 @@ func setupLocalArtifactory() (err error) {
 		return errors.New("no license provided. Aborting. Provide license by setting the '" + licenseEnv + "' env var")
 	}
 
+	isOSS := strings.EqualFold(license, "oss")
+
 	jfrogHome, err := prepareJFrogHome()
 	if err != nil {
 		return err
@@ -93,7 +98,7 @@ func setupLocalArtifactory() (err error) {
 		return err
 	}
 
-	pathToArchive, err := downloadArtifactory(jfrogHome, *rtVersion, isArtifactory6)
+	pathToArchive, err := downloadArtifactory(jfrogHome, *rtVersion, isArtifactory6, isOSS)
 	if err != nil {
 		return err
 	}
@@ -115,7 +120,7 @@ func setupLocalArtifactory() (err error) {
 		}
 	}
 
-	if err = createLicenseFile(jfrogHome, license, isArtifactory6); err != nil {
+	if err = createLicenseFile(jfrogHome, license, isArtifactory6, isOSS); err != nil {
 		return err
 	}
 
@@ -124,7 +129,7 @@ func setupLocalArtifactory() (err error) {
 		binDir = filepath.Join(jfrogHome, "artifactory", "bin")
 	} else {
 		binDir = filepath.Join(jfrogHome, "artifactory", "app", "bin")
-		if err = handleArtifactory7(jfrogHome); err != nil {
+		if err = handleArtifactory7(jfrogHome, isOSS); err != nil {
 			return err
 		}
 	}
@@ -145,7 +150,7 @@ func setupLocalArtifactory() (err error) {
 			dumpLogs(jfrogHome)
 			return err
 		}
-		if err = exportTokenUsingGithubEnvFile(adminToken); err != nil {
+		if err = exportRTEnvironmentUsingGithubEnvFile(adminToken, isOSS); err != nil {
 			return err
 		}
 	}
@@ -204,7 +209,9 @@ func renameArtifactoryDir(jfrogHome string) error {
 	}
 
 	for _, file := range fileInfo {
-		if file.IsDir() && strings.HasPrefix(file.Name(), "artifactory-pro-") {
+		if file.IsDir() &&
+				(strings.HasPrefix(file.Name(), "artifactory-pro-") ||
+				 strings.HasPrefix(file.Name(), "artifactory-oss-")) {
 			return os.Rename(filepath.Join(jfrogHome, file.Name()), filepath.Join(jfrogHome, "artifactory"))
 		}
 	}
@@ -327,8 +334,8 @@ func waitForArtifactorySuccessfulPing(timeoutSeconds int) (err error) {
 	return
 }
 
-func handleArtifactory7(jfrogHome string) error {
-	if err := createSystemYaml(jfrogHome); err != nil {
+func handleArtifactory7(jfrogHome string, isOSS bool) error {
+	if err := createSystemYaml(jfrogHome, isOSS); err != nil {
 		return err
 	}
 	if err := allowStagingMode(jfrogHome); err != nil {
@@ -338,7 +345,11 @@ func handleArtifactory7(jfrogHome string) error {
 }
 
 // Create system.yaml file in the etc directory.
-func createSystemYaml(jfrogHome string) error {
+func createSystemYaml(jfrogHome string, isOSS bool) error {
+	systemYaml := systemYamlPro
+	if isOSS {
+		systemYaml = systemYamlOss
+	}
 	return os.WriteFile(filepath.Join(jfrogHome, artifactoryVarEtcPath, "system.yaml"), []byte(systemYaml), 0o611)
 }
 
@@ -354,10 +365,10 @@ func allowStagingMode(jfrogHome string) error {
 }
 
 // More info at: https://docs.github.com/en/github-ae@latest/actions/using-workflows/workflow-commands-for-github-actions#environment-files
-func exportTokenUsingGithubEnvFile(adminToken string) (err error) {
+func exportRTEnvironmentUsingGithubEnvFile(adminToken string, isOSS bool) (err error) {
 	githubEnvPath, exists := os.LookupEnv(githubEnvFileEnv)
 	if !exists {
-		log.Printf("GITHUB_ENV not set, assuming the script is not running on Github. Skipping token export...")
+		log.Printf("%s not set, assuming the script is not running on Github. Skipping token export...", githubEnvFileEnv)
 		return
 	}
 
@@ -368,10 +379,11 @@ func exportTokenUsingGithubEnvFile(adminToken string) (err error) {
 
 	defer closeQuietly(githubEnvFile, "error when closing github env file")
 
-	if _, err = githubEnvFile.WriteString(fmt.Sprintf("%s=%s\n", jfrogLocalAccessToken, adminToken)); err != nil {
+	// if _, err = githubEnvFile.WriteString(fmt.Sprintf("%s=%s\n", jfrogLocalAccessToken, adminToken)); err != nil {
+	if _, err = fmt.Fprintf(githubEnvFile, "%s=%s\n%s=%t\n", jfrogLocalAccessToken, adminToken, jfrogIsOssVariant, isOSS); err != nil {
 		return
 	}
-	log.Printf("Successfuly exported Artifactory admin token to github_env...")
+	log.Printf("Successfuly exported RT environment to %s...", githubEnvFileEnv)
 	return
 }
 
@@ -457,8 +469,13 @@ func setCustomUrlBase() error {
 	return nil
 }
 
-func downloadArtifactory(downloadDest, rtVersion string, artifactory6 bool) (pathToArchive string, err error) {
-	url := fmt.Sprintf("https://releases.jfrog.io/artifactory/artifactory-pro/org/artifactory/pro/jfrog-artifactory-pro/%[1]s/jfrog-artifactory-pro-%[1]s", rtVersion)
+func downloadArtifactory(downloadDest, rtVersion string, artifactory6 bool, isOSS bool) (pathToArchive string, err error) {
+	var url string
+	if isOSS {
+		url = fmt.Sprintf("https://releases.jfrog.io/artifactory/bintray-artifactory/org/artifactory/oss/jfrog-artifactory-oss/%[1]s/jfrog-artifactory-oss-%[1]s", rtVersion)
+	} else {
+		url = fmt.Sprintf("https://releases.jfrog.io/artifactory/artifactory-pro/org/artifactory/pro/jfrog-artifactory-pro/%[1]s/jfrog-artifactory-pro-%[1]s", rtVersion)
+	}
 	if !artifactory6 {
 		switch runtime.GOOS {
 		case "darwin":
@@ -513,7 +530,7 @@ func extract(archivePath string, destDir string) error {
 	return archiver.Unarchive(archivePath, destDir)
 }
 
-func createLicenseFile(jfrogHome, license string, artifactory6 bool) (err error) {
+func createLicenseFile(jfrogHome, license string, artifactory6 bool, isOSS bool) (err error) {
 	log.Println("Creating license...")
 
 	defer func() {
@@ -525,6 +542,11 @@ func createLicenseFile(jfrogHome, license string, artifactory6 bool) (err error)
 			}
 		}
 	}()
+
+	if isOSS {
+		log.Println("Artifactory OSS installation - skip creating license.")
+		return nil
+	}
 
 	var fileDest string
 	if artifactory6 {
